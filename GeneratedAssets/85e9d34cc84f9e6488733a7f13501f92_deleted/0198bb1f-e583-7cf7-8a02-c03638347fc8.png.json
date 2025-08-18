@@ -1,0 +1,20 @@
+{
+    "asset": "85e9d34cc84f9e6488733a7f13501f92",
+    "fileName": "0198bb1f-e583-7cf7-8a02-c03638347fc8.png",
+    "prompt": "Grass texture, soft, pastel, cozy",
+    "negativePrompt": "",
+    "model": "01a2b3ec-2fef-4f7b-9bcc-799f9647ab23",
+    "modelName": "3D Platformer Environments",
+    "customSeed": -1,
+    "w3CTraceId": "b2eb3f161d169561014ed261efbfb7b9",
+    "refinementMode": "Generation",
+    "pixelateTargetSize": 0,
+    "pixelateKeepImageSize": false,
+    "pixelatePixelBlockSize": 0,
+    "pixelateMode": 0,
+    "pixelateOutlineThickness": 0,
+    "doodles": {
+        "m_Items": []
+    },
+    "upscaleFactor": 0
+}

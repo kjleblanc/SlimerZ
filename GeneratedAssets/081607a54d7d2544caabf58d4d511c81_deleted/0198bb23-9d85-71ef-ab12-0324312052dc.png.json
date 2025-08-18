@@ -1,0 +1,29 @@
+{
+    "asset": "081607a54d7d2544caabf58d4d511c81",
+    "fileName": "0198bb23-9d85-71ef-ab12-0324312052dc.png",
+    "prompt": "Grass texture",
+    "negativePrompt": "",
+    "model": "01a2b3ec-2fef-4f7b-9bcc-799f9647ab23",
+    "modelName": "3D Platformer Environments",
+    "customSeed": -1,
+    "w3CTraceId": "839e6d2cdc0e63730c95959a79fdb6f1",
+    "refinementMode": "Generation",
+    "pixelateTargetSize": 0,
+    "pixelateKeepImageSize": false,
+    "pixelatePixelBlockSize": 0,
+    "pixelateMode": 0,
+    "pixelateOutlineThickness": 0,
+    "doodles": {
+        "m_Items": [
+            {
+                "doodleReferenceType": 7,
+                "doodle": [],
+                "label": "Image",
+                "strength": 0.23999999463558198,
+                "invertStrength": false,
+                "assetReferenceGuid": "6628af03facea3f48ae724e3fb28e713"
+            }
+        ]
+    },
+    "upscaleFactor": 0
+}
