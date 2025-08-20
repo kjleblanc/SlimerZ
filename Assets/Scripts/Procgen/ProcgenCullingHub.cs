@@ -1,211 +1,257 @@
-using UnityEngine;
+// Assets/Scripts/Procgen/ProcgenCullingHub.cs
 using System.Collections.Generic;
-
+using UnityEngine;
 #if UNITY_EDITOR
 using UnityEditor;
-using UnityEditor.SceneManagement;
+using UnityEngine.Rendering;
 #endif
+
+/// <summary>
+/// One-stop renderer for all instanced procgen batches.
+/// - Discovers spawners (ChildrenOfThis or WholeScene) that implement IProcgenInstancedSource
+/// - Pulls batches (mesh/material/matrices/bounds) and draws them once per camera
+/// - CPU frustum culling + optional facing and distance caps (global + per-tag)
+/// - Works in Edit and Play modes; debug gizmos match runtime culling
+/// </summary>
 
 [ExecuteAlways]
 [DisallowMultipleComponent]
 public class ProcgenCullingHub : MonoBehaviour
 {
-    [System.Serializable]
+    // -------- Public batch API --------
+    public enum BatchTag { Generic, TreeWood, TreeLeaves, Grass, Rocks }
+
     public struct Batch
     {
         public Mesh mesh;
-        public int submeshIndex; // NEW
+        public int submeshIndex;
         public Material material;
-        public Matrix4x4[] matrices;
-        public Bounds bounds;
+        public Matrix4x4[] matrices;  // ≤1023 per array
+        public Bounds bounds;         // our culling/debug bounds
         public int layer;
         public UnityEngine.Rendering.ShadowCastingMode shadowCasting;
         public bool receiveShadows;
+        public BatchTag tag;
     }
 
-    [Header("Culling")]
+    // -------- Discovery --------
+    public enum DiscoveryMode { ChildrenOfThis, WholeScene }
+
+    [Header("Discovery")]
+    public DiscoveryMode discovery = DiscoveryMode.ChildrenOfThis;
+    public bool includeInactive = true;
+
+    // -------- Cameras --------
+    [Header("Camera")]
+    public Camera targetCameraOverride = null;
+    public bool preferMainCameraInEditMode = true;
+
+    // -------- Culling --------
+    [Header("Culling (global)")]
     public bool enableCulling = true;
-    [Range(-1f, 1f)] public float facingDotMin = 0.0f;
+    [Tooltip("Global max draw distance in meters (−1 = unlimited).")]
     public float maxViewDistance = 300f;
 
+    [Tooltip("Enable facing cull (compare camera forward to batch center).")]
+    public bool enableFacingCulling = false;
+    [Range(-1f, 1f)] public float facingDotMin = 0.0f; // used only if enableFacingCulling=true
+
+    [Header("Per-tag max distance (m)  (−1 = unlimited)")]
+    public float maxDistTreeLeaves = 80f;
+    public float maxDistGrass     = 120f;
+
+    [Header("Shadows")]
+    [Tooltip("Apply facing culling during shadow rendering too (usually OFF to avoid shadow popping).")]
+    public bool applyFacingInShadows = false;
+    [Tooltip("Apply per-tag distance caps during shadow rendering too (usually OFF to keep stable shadows).")]
+    public bool applyDistanceCapsInShadows = false;
+
+    // -------- Draw / Debug --------
     [Header("Draw")]
     public bool drawInEditAndPlay = true;
 
     [Header("Debug")]
     public bool debugDrawBounds = false;
-    public Color debugVisible = new Color(0, 1, 0, 0.25f);
-    public Color debugCulled = new Color(1, 0, 0, 0.15f);
+    public Color debugVisible = new Color(0f, 1f, 0f, 0.25f);
+    public Color debugCulled  = new Color(1f, 0f, 0f, 0.15f);
 
-    [Header("Camera")]
-    public Camera targetCameraOverride;                 // assign to force a camera
-    public bool preferMainCameraInEditMode = true;      // use Main Camera even in edit mode
-
-    public enum CullingMode { CullingGroup, CPUFrustum }
-    
-    [Header("Culling")]
-    public CullingMode cullingMode = CullingMode.CullingGroup;  
-
-
-
-    Camera _boundCamera;
-    CullingGroup _group;
-    BoundingSphere[] _spheres = System.Array.Empty<BoundingSphere>();
-
+    // -------- Internals --------
     readonly List<IProcgenInstancedSource> _sources = new();
     readonly List<Batch> _batches = new();
 
-    Camera GetActiveCameraForDebug()
+    void OnEnable()
     {
-        if (targetCameraOverride) return targetCameraOverride;
-    #if UNITY_EDITOR
-        if (!Application.isPlaying && preferMainCameraInEditMode && Camera.main) return Camera.main;
-        var sv = UnityEditor.SceneView.lastActiveSceneView;
-        if (!Application.isPlaying && sv && sv.camera) return sv.camera;
-    #endif
-        return _boundCamera ? _boundCamera : Camera.main;
+#if UNITY_EDITOR
+        RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering_SRP;
+#endif
+        Camera.onPreCull += OnPreCull_BuiltIn;
+        RefreshAll();
     }
 
-
-    void OnEnable() { BindToBestCamera(); RefreshAll(); }
-    void OnDisable() { ReleaseGroup(); _sources.Clear(); _batches.Clear(); _spheres = System.Array.Empty<BoundingSphere>(); }
-    void Update()
+    void OnDisable()
     {
-        if (!drawInEditAndPlay) return;
-        if (!_boundCamera || (Application.isPlaying && _boundCamera != Camera.main)) BindToBestCamera();
+#if UNITY_EDITOR
+        RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering_SRP;
+#endif
+        Camera.onPreCull -= OnPreCull_BuiltIn;
+        _sources.Clear();
+        _batches.Clear();
     }
 
     public void NotifyDirty() => RefreshAll();
 
     public void RefreshAll()
     {
+        // 1) discover
         _sources.Clear();
-        GetComponentsInChildren(true, _sources);
+        if (discovery == DiscoveryMode.ChildrenOfThis)
+        {
+            var monos = GetComponentsInChildren<MonoBehaviour>(includeInactive);
+            for (int i = 0; i < monos.Length; i++)
+                if (monos[i] is IProcgenInstancedSource s) _sources.Add(s);
+        }
+        else
+        {
+#if UNITY_2022_2_OR_NEWER
+            var monos = FindObjectsByType<MonoBehaviour>(
+                includeInactive ? FindObjectsInactive.Include : FindObjectsInactive.Exclude,
+                FindObjectsSortMode.None);
+#else
+            var monos = Resources.FindObjectsOfTypeAll<MonoBehaviour>();
+#endif
+            for (int i = 0; i < monos.Length; i++)
+                if (monos[i] is IProcgenInstancedSource s)
+                    if (includeInactive || (monos[i].isActiveAndEnabled && monos[i].gameObject.activeInHierarchy))
+                        _sources.Add(s);
+        }
 
+        // 2) pull batches
         _batches.Clear();
-        foreach (var src in _sources)
+        for (int i = 0; i < _sources.Count; i++)
         {
-            var list = src.GetInstancedBatches();
+            var list = _sources[i].GetInstancedBatches();
             if (list == null) continue;
-            foreach (var b in list)
-                if (b.mesh && b.material && b.matrices != null && b.matrices.Length > 0)
-                    _batches.Add(b);
+            for (int j = 0; j < list.Count; j++)
+            {
+                var b = list[j];
+                if (!b.mesh || !b.material || b.matrices == null || b.matrices.Length == 0) continue;
+                _batches.Add(b);
+            }
         }
-
-        if (_batches.Count == 0) { _spheres = System.Array.Empty<BoundingSphere>(); RebindGroup(); return; }
-
-        if (_spheres.Length != _batches.Count)
-            _spheres = new BoundingSphere[_batches.Count];
-
-        for (int i = 0; i < _batches.Count; i++)
-        {
-            var b = _batches[i];
-            float r = b.bounds.extents.magnitude;
-            _spheres[i] = new BoundingSphere(b.bounds.center, r);
-        }
-        RebindGroup();
     }
 
-    void OnRenderObject()
+#if UNITY_EDITOR
+    void OnBeginCameraRendering_SRP(UnityEngine.Rendering.ScriptableRenderContext ctx, Camera cam)
     {
-        if (!drawInEditAndPlay || _batches.Count == 0) return;
+        if (!Application.isPlaying) { if (!ShouldDrawFor(cam)) return; }
+        DrawForCamera(cam);
+    }
+#endif
 
-        Camera cam = targetCameraOverride ? targetCameraOverride : Camera.current;
-        if (!cam) cam = _boundCamera ? _boundCamera : Camera.main;
-        if (!cam) return;
+    void OnPreCull_BuiltIn(Camera cam)
+    {
+#if UNITY_EDITOR
+        if (UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline != null) return; // SRP active
+#endif
+        if (!ShouldDrawFor(cam)) return;
+        DrawForCamera(cam);
+    }
 
-        if (cullingMode == CullingMode.CullingGroup)
-        {
-            if (cam != _boundCamera) { BindToCamera(cam); RebindGroup(); }
-            Vector3 camPos = cam.transform.position, camFwd = cam.transform.forward;
-            float maxDistSqr = (maxViewDistance > 0f) ? maxViewDistance * maxViewDistance : float.PositiveInfinity;
+    bool ShouldDrawFor(Camera cam)
+    {
+        if (!drawInEditAndPlay || cam == null) return false;
 
-            for (int i = 0; i < _batches.Count; i++)
-            {
-                var b = _batches[i];
-                if (enableCulling && _group != null)
-                {
-                    if (!_group.IsVisible(i)) continue;
-                    var to = b.bounds.center - camPos;
-                    if (to.sqrMagnitude > maxDistSqr) continue;
-                    if (facingDotMin > -0.999f && Vector3.Dot(camFwd, to.normalized) < facingDotMin) continue;
-                }
-                Graphics.DrawMeshInstanced(b.mesh, b.submeshIndex, b.material, b.matrices, b.matrices.Length, null,
-                    b.shadowCasting, b.receiveShadows, b.layer);
-            }
-            return;
-        }
+        // explicit override wins
+        if (targetCameraOverride && cam != targetCameraOverride) return false;
 
-        // CPU frustum mode (per-camera, matches what you see)
-        Plane[] planes = GeometryUtility.CalculateFrustumPlanes(cam);
-        Vector3 cPos = cam.transform.position, cFwd = cam.transform.forward;
-        float max2 = (maxViewDistance > 0f) ? maxViewDistance * maxViewDistance : float.PositiveInfinity;
+#if UNITY_EDITOR
+        // edit mode sanity: prefer MainCamera if requested
+        if (!Application.isPlaying && preferMainCameraInEditMode && Camera.main && cam != Camera.main)
+            return false;
+#endif
+        return true;
+    }
+
+    // ------- Core draw (CPU frustum; no culling-group) -------
+    void DrawForCamera(Camera cam)
+    {
+        if (_batches.Count == 0) return;
+
+        bool isShadow = IsShadowLike(cam);
+        var planes = enableCulling ? GeometryUtility.CalculateFrustumPlanes(cam) : null;
+        Vector3 camPos = cam.transform.position, camFwd = cam.transform.forward;
 
         for (int i = 0; i < _batches.Count; i++)
         {
             var b = _batches[i];
-            bool vis = true;
+
             if (enableCulling)
             {
-                if (!GeometryUtility.TestPlanesAABB(planes, b.bounds)) vis = false;
-                if (vis && maxViewDistance > 0f)
+                // 1) Frustum
+                if (planes != null && !GeometryUtility.TestPlanesAABB(planes, b.bounds))
+                    continue;
+
+                // 2) Distance (global + per-tag; usually skipped for shadow cams)
+                float cap = EffectiveDistanceCap(b.tag);
+                bool applyDist = !isShadow || applyDistanceCapsInShadows;
+                if (applyDist && cap > 0f)
                 {
-                    var to = b.bounds.center - cPos;
-                    if (to.sqrMagnitude > max2) vis = false;
-                    else if (facingDotMin > -0.999f && Vector3.Dot(cFwd, to.normalized) < facingDotMin) vis = false;
+                    var to = b.bounds.center - camPos;
+                    if (to.sqrMagnitude > cap * cap) continue;
+                }
+
+                // 3) Facing (usually skipped for shadow cams)
+                bool applyFacing = enableFacingCulling && (!isShadow || applyFacingInShadows);
+                if (applyFacing)
+                {
+                    var to = b.bounds.center - camPos;
+                    var dir = to.sqrMagnitude > 1e-6f ? to.normalized : Vector3.forward;
+                    if (Vector3.Dot(camFwd, dir) < facingDotMin) continue;
                 }
             }
-            if (!vis) continue;
-            Graphics.DrawMeshInstanced(b.mesh, b.submeshIndex, b.material, b.matrices, b.matrices.Length, null,
+
+            Graphics.DrawMeshInstanced(
+                b.mesh, b.submeshIndex, b.material, b.matrices, b.matrices.Length, null,
                 b.shadowCasting, b.receiveShadows, b.layer);
         }
     }
 
-
-    void BindToBestCamera()
+    float EffectiveDistanceCap(BatchTag tag)
     {
-        Camera target = targetCameraOverride;
-    #if UNITY_EDITOR
-        if (!Application.isPlaying && preferMainCameraInEditMode && target == null)
-            target = Camera.main;
-        if (!Application.isPlaying && target == null && UnityEditor.SceneView.lastActiveSceneView)
-            target = UnityEditor.SceneView.lastActiveSceneView.camera;
-    #endif
-        if (target == null) target = Camera.main;
-        BindToCamera(target);
+        float tagCap = -1f;
+        switch (tag)
+        {
+            case BatchTag.TreeLeaves: tagCap = maxDistTreeLeaves; break;
+            case BatchTag.Grass:      tagCap = maxDistGrass;      break;
+            default:                  tagCap = -1f;               break;
+        }
+
+        bool hasGlobal = maxViewDistance > 0f;
+        bool hasTag    = tagCap > 0f;
+
+        if (hasGlobal && hasTag) return Mathf.Min(maxViewDistance, tagCap);
+        if (hasGlobal) return maxViewDistance;
+        if (hasTag)    return tagCap;
+        return -1f;
     }
 
-
-    void BindToCamera(Camera cam)
+    static bool IsShadowLike(Camera cam)
     {
-        _boundCamera = cam;
-        if (_group == null) _group = new CullingGroup();
-        _group.targetCamera = _boundCamera;
-        _group.onStateChanged = null;
+        if (!cam) return false;
+        // Heuristic: URP/BIRP shadow cams typically contain "Shadow" in the name.
+        var n = cam.name;
+        return !string.IsNullOrEmpty(n) && n.IndexOf("shadow", System.StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
-    void RebindGroup()
-    {
-        if (_group == null) return;
-        _group.SetBoundingSpheres(_spheres);
-        _group.SetBoundingSphereCount(_spheres.Length);
-        if (maxViewDistance > 0f) _group.SetBoundingDistances(new float[] { maxViewDistance });
-        else _group.SetBoundingDistances(System.Array.Empty<float>());
-    }
-
-    void ReleaseGroup() { if (_group != null) { _group.Dispose(); _group = null; } }
-    
+    // ------- Debug gizmos (mirrors runtime rules) -------
     void OnDrawGizmosSelected()
     {
         if (!debugDrawBounds || _batches == null || _batches.Count == 0) return;
-
-        var cam = GetActiveCameraForDebug();
+        var cam = GetDebugCamera();
+        bool isShadow = IsShadowLike(cam);
         Vector3 camPos = cam ? cam.transform.position : Vector3.zero;
         Vector3 camFwd = cam ? cam.transform.forward : Vector3.forward;
-        float maxDistSqr = (maxViewDistance > 0f) ? maxViewDistance * maxViewDistance : float.PositiveInfinity;
-
-        Plane[] planes = (enableCulling && cam)
-            ? GeometryUtility.CalculateFrustumPlanes(cam)
-            : null;
+        var planes = (enableCulling && cam) ? GeometryUtility.CalculateFrustumPlanes(cam) : null;
 
         for (int i = 0; i < _batches.Count; i++)
         {
@@ -214,30 +260,47 @@ public class ProcgenCullingHub : MonoBehaviour
 
             if (enableCulling)
             {
-                // 1) Frustum (fallback to true if no camera)
                 if (planes != null && !GeometryUtility.TestPlanesAABB(planes, b.bounds))
                     vis = false;
 
-                // 2) Distance
-                if (vis && maxViewDistance > 0f)
+                if (vis)
                 {
-                    var to = b.bounds.center - camPos;
-                    if (to.sqrMagnitude > maxDistSqr) vis = false;
+                    float cap = EffectiveDistanceCap(b.tag);
+                    bool applyDist = !isShadow || applyDistanceCapsInShadows;
+                    if (applyDist && cap > 0f && cam)
+                    {
+                        var to = b.bounds.center - camPos;
+                        if (to.sqrMagnitude > cap * cap) vis = false;
+                    }
                 }
 
-                // 3) Facing
-                if (vis && facingDotMin > -0.999f && cam)
+                if (vis)
                 {
-                    var to = (b.bounds.center - camPos).normalized;
-                    if (Vector3.Dot(camFwd, to) < facingDotMin) vis = false;
+                    bool applyFacing = enableFacingCulling && (!isShadow || applyFacingInShadows) && cam;
+                    if (applyFacing)
+                    {
+                        var to = (b.bounds.center - camPos);
+                        var dir = to.sqrMagnitude > 1e-6f ? to.normalized : Vector3.forward;
+                        if (Vector3.Dot(camFwd, dir) < facingDotMin) vis = false;
+                    }
                 }
             }
 
             Gizmos.color = vis ? debugVisible : debugCulled;
             Gizmos.DrawCube(b.bounds.center, b.bounds.size);
-            Gizmos.color = Color.black; Gizmos.DrawWireCube(b.bounds.center, b.bounds.size);
+            Gizmos.color = Color.black;
+            Gizmos.DrawWireCube(b.bounds.center, b.bounds.size);
         }
     }
 
-
+    Camera GetDebugCamera()
+    {
+        if (targetCameraOverride) return targetCameraOverride;
+#if UNITY_EDITOR
+        if (!Application.isPlaying && preferMainCameraInEditMode && Camera.main) return Camera.main;
+        var sv = SceneView.lastActiveSceneView;
+        if (!Application.isPlaying && sv && sv.camera) return sv.camera;
+#endif
+        return Camera.main;
+    }
 }

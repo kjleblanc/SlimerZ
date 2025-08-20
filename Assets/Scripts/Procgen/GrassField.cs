@@ -38,7 +38,7 @@ public class GrassField : ProcgenSpawnerBase
 
     void Start()
     {
-        if (!terrainSource) terrainSource = Object.FindObjectOfType<ProceduralTerrain>();
+        if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>();
         EnsureDefaults();
         Build();
     }
@@ -84,7 +84,7 @@ public class GrassField : ProcgenSpawnerBase
             grassMaterial = new Material(sh) { name = "M_Grass (runtime)" };
         }
         grassMaterial.enableInstancing = true;
-        if (!terrainSource) terrainSource = Object.FindObjectOfType<ProceduralTerrain>();
+        if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>();
     }
 
     void Scatter()
@@ -132,6 +132,10 @@ public class GrassField : ProcgenSpawnerBase
 
             if (slope01 > maxSlope01) continue;
 
+            // Skip underwater positions
+            var water = transform.parent?.GetComponentInChildren<ProceduralWater>();
+            if (water && water.IsWater(pos)) continue;
+
             float spawnProb = Mathf.Max(minSpawnProb, Mathf.Lerp(1f, moist01, moistureBias));
             if (_rng.NextDouble() > spawnProb) continue;
 
@@ -163,7 +167,7 @@ public class GrassField : ProcgenSpawnerBase
                 _instances.CopyTo(offset, arr, 0, count);
                 offset += count;
 
-                Bounds b = ComputeBoundsFromMatrices(arr, expand: 0.5f);
+                Bounds b = ProcgenBoundsUtil.FromInstances(arr, _bladeMesh, 0.5f);
 
                 _batches.Add(arr);
                 _exposedBatches.Add(new ProcgenCullingHub.Batch {
@@ -198,8 +202,8 @@ public class GrassField : ProcgenSpawnerBase
                 list.CopyTo(offset, arr, 0, count);
                 offset += count;
 
-                var b = grid.BoundsOf(ck.Key);
-                b.Expand(0.5f);
+                var b = ProcgenBoundsUtil.FromInstances(arr, _bladeMesh, 0.5f);
+
 
                 _batches.Add(arr);
                 _exposedBatches.Add(new ProcgenCullingHub.Batch {

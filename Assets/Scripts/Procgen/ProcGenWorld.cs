@@ -9,6 +9,7 @@ public class ProcgenWorld : MonoBehaviour
 {
     [Header("What to generate")]
     public bool makeTerrain = true;
+    public bool makeWater   = true;  // NEW
     public bool makeTrees   = true;
     public bool makeRocks   = true;
     public bool makeGrass   = true;
@@ -20,6 +21,9 @@ public class ProcgenWorld : MonoBehaviour
     public bool useChunkGrid = true;
     public Vector2Int gridDims = new Vector2Int(8, 8);
 
+    [Header("Water Settings")]  // NEW
+    public float waterLevel = 5f;
+    public int minWaterBodySize = 10;
 
     [Header("Counts (high level)")]
     public int trees = 600;
@@ -36,11 +40,12 @@ public class ProcgenWorld : MonoBehaviour
     public bool autorunInEditor = true;
 
     [Header("References (auto-created as children)")]
-    public ProceduralTerrain terrain;                 // "ProcTerrain"
-    public InstancedTreeField treeField;              // "TreeField"
-    public InstancedRockField rockField;      // "RockField"
-    public GrassField grassField;                     // "GrassField"
-    public ProcgenCullingHub cullingHub;              // on this GameObject
+    public ProceduralTerrain terrain;
+    public ProceduralWater water;                     // NEW
+    public InstancedTreeField treeField;
+    public InstancedRockField rockField;
+    public GrassField grassField;
+    public ProcgenCullingHub cullingHub;
 
 #if UNITY_EDITOR
     bool _queued;
@@ -75,6 +80,15 @@ public class ProcgenWorld : MonoBehaviour
             terrain.Rebuild();
         }
 
+        // Water (NEW - build after terrain)
+        if (makeWater && water && terrain)
+        {
+            water.terrainSource = terrain;
+            water.waterLevel = waterLevel;
+            water.minWaterBodySize = minWaterBodySize;
+            water.Rebuild();
+        }
+
         // Terrain bounds → center & size
         Vector3 tPos  = terrain ? terrain.terrain.transform.position : transform.position;
         Vector3 tSize = terrain ? terrain.terrain.terrainData.size : new Vector3(200, 25, 200);
@@ -100,8 +114,6 @@ public class ProcgenWorld : MonoBehaviour
             Grid = grid  
         };
 
-       
-
         // Trees
         if (makeTrees && treeField)
         {
@@ -114,7 +126,6 @@ public class ProcgenWorld : MonoBehaviour
             treeField.Configure(ctx);
             treeField.Rebuild();
 
-            // Optionally sync biome rules (only if you want right now)
             if (biome)
             {
                 treeField.maxSlope01   = biome.treeMaxSlope01;
@@ -154,7 +165,7 @@ public class ProcgenWorld : MonoBehaviour
             grassField.terrainSource = terrain;
             grassField.bladeCount = Mathf.RoundToInt(grass * (biome ? biome.globalDensity : 1f));
             grassField.Configure(ctx);
-            // sync biome rules (optional now)
+            
             if (biome)
             {
                 grassField.maxSlope01    = biome.grassMaxSlope01;
@@ -186,6 +197,19 @@ public class ProcgenWorld : MonoBehaviour
                 terrain = go.AddComponent<ProceduralTerrain>();
             }
             else terrain = tObj;
+        }
+
+        // Water (NEW)
+        if (!water && makeWater)
+        {
+            var w = transform.Find("Water")?.GetComponent<ProceduralWater>();
+            if (!w)
+            {
+                var go = new GameObject("Water");
+                go.transform.SetParent(transform, false);
+                water = go.AddComponent<ProceduralWater>();
+            }
+            else water = w;
         }
 
         // TreeField
