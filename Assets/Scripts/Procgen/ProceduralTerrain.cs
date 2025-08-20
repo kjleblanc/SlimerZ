@@ -34,6 +34,27 @@ public class ProceduralTerrain : MonoBehaviour
     [Range(0f, 1f)] public float moistureNoiseBlend = 0.4f;
     public float moistureNoiseScale = 0.006f;
 
+    [Header("Mask Calibration")]
+    public bool autoCalibrateMasks = true;
+
+    [Header("Auto-paint Terrain")]
+    public bool autoPaint = true;
+    [Range(32, 2048)] public int splatResolution = 256;
+
+    // flat tints (stylized)
+    public Color grassTint = new Color(0.48f, 0.75f, 0.42f);
+    public Color dirtTint  = new Color(0.55f, 0.47f, 0.40f);
+    public Color rockTint  = new Color(0.70f, 0.70f, 0.72f);
+
+    // thresholds (0..1 from masks)
+    [Tooltip("Slope blend to rock: lower=start of rock, higher=full rock")]
+    [Range(0,1)] public float slopeRockStart = 0.20f;
+    [Range(0,1)] public float slopeRockEnd   = 0.40f;
+
+    [Tooltip("Moisture blend to grass: lower=drier, higher=wetter")]
+    [Range(0,1)] public float moistGrassStart = 0.40f;
+    [Range(0,1)] public float moistGrassEnd   = 0.60f;
+
     [Header("Output (read-only)")]
     public Terrain terrain;
     public Texture2D slopeMask;    // grayscale
@@ -114,6 +135,14 @@ public class ProceduralTerrain : MonoBehaviour
 
         // Build masks
         BuildMasks(td, heights);
+
+        // Ensure URP material, paint layers from masks
+        EnsureURPTerrainMaterial();
+        if (autoPaint)
+        {
+            EnsureLayers(td);
+            AutoPaintFromMasks(td);
+        }
     }
 
     void EnsureMaterialAndLayer(TerrainData td)
@@ -133,6 +162,15 @@ public class ProceduralTerrain : MonoBehaviour
         }
     }
 
+    void EnsureURPTerrainMaterial()
+    {
+        if (!terrain) return;
+        var urp = Shader.Find("Universal Render Pipeline/Terrain/Lit");
+        if (!urp) return;
+        if (!terrain.materialTemplate || terrain.materialTemplate.shader != urp)
+            terrain.materialTemplate = new Material(urp) { name = "M_TerrainURP (runtime)" };
+    }
+
     Texture2D MakeSolidColorTex(Color c)
     {
         var tex = new Texture2D(2, 2, TextureFormat.RGB24, false, true);
@@ -140,6 +178,67 @@ public class ProceduralTerrain : MonoBehaviour
         tex.wrapMode = TextureWrapMode.Repeat; tex.filterMode = FilterMode.Bilinear;
         tex.name = "SolidColor";
         return tex;
+    }
+
+    void EnsureLayers(TerrainData td)
+    {
+        // 0 = Grass, 1 = Dirt, 2 = Rock
+        var layers = td.terrainLayers;
+        if (layers == null || layers.Length < 3) layers = new TerrainLayer[3];
+
+        if (layers[0] == null) layers[0] = new TerrainLayer();
+        if (layers[1] == null) layers[1] = new TerrainLayer();
+        if (layers[2] == null) layers[2] = new TerrainLayer();
+
+        layers[0].diffuseTexture = layers[0].diffuseTexture ?? MakeSolidColorTex(grassTint);
+        layers[1].diffuseTexture = layers[1].diffuseTexture ?? MakeSolidColorTex(dirtTint);
+        layers[2].diffuseTexture = layers[2].diffuseTexture ?? MakeSolidColorTex(rockTint);
+
+        layers[0].tileSize = layers[1].tileSize = layers[2].tileSize = new Vector2(10, 10);
+
+        td.terrainLayers = layers; // assign back
+    }
+
+    static float Smooth01(float x, float a, float b) => Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(a, b, x));
+
+    void AutoPaintFromMasks(TerrainData td)
+    {
+        if (!slopeMask || !moistureMask) return;
+
+        td.alphamapResolution = splatResolution;
+        int w = td.alphamapWidth, h = td.alphamapHeight;
+        const int LAYERS = 3; // grass, dirt, rock
+        var splat = new float[h, w, LAYERS];
+
+        for (int y = 0; y < h; y++)
+        {
+            float v = y / (float)(h - 1);
+            for (int x = 0; x < w; x++)
+            {
+                float u = x / (float)(w - 1);
+                float slope = slopeMask.GetPixelBilinear(u, v).r;
+                float moist = moistureMask.GetPixelBilinear(u, v).r;
+
+                // rock by slope
+                float rock = Smooth01(slope, slopeRockStart, slopeRockEnd);
+
+                // grass by moisture (clamped by not-rock)
+                float grass = Smooth01(moist, moistGrassStart, moistGrassEnd) * (1f - rock);
+
+                // dirt = remainder
+                float dirt = Mathf.Max(0f, 1f - (rock + grass));
+
+                // normalize
+                float sum = rock + grass + dirt;
+                if (sum <= 0f) { rock = 0; grass = 0; dirt = 1; }
+                else { rock /= sum; grass /= sum; dirt /= sum; }
+
+                splat[y, x, 0] = grass;
+                splat[y, x, 1] = dirt;
+                splat[y, x, 2] = rock;
+            }
+        }
+        td.SetAlphamaps(0, 0, splat);
     }
 
     void OnValidate()
@@ -225,8 +324,26 @@ public class ProceduralTerrain : MonoBehaviour
             }
         }
 
+        if (autoCalibrateMasks)
+        {
+            float sMin=1f,sMax=0f,mMin=1f,mMax=0f;
+            for (int i=0;i<slopePixels.Length;i++){
+                float s=slopePixels[i].r, m=moistPixels[i].r;
+                if (s<sMin) sMin=s; if (s>sMax) sMax=s;
+                if (m<mMin) mMin=m; if (m>mMax) mMax=m;
+            }
+            float eps=1e-5f;
+            for (int i=0;i<slopePixels.Length;i++){
+                float s=(slopePixels[i].r - sMin)/Mathf.Max(eps, sMax-sMin);
+                float m=(moistPixels[i].r - mMin)/Mathf.Max(eps, mMax-mMin);
+                slopePixels[i] = new Color(s,s,s,1);
+                moistPixels[i] = new Color(m,m,m,1);
+            }
+        }
+        // now write textures
         slopeMask.SetPixels(slopePixels);    slopeMask.Apply(false, false);
         moistureMask.SetPixels(moistPixels); moistureMask.Apply(false, false);
+
     }
 
     Texture2D NewOrResize(Texture2D tex, int w, int h, TextureFormat fmt)

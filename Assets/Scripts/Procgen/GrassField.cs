@@ -1,8 +1,9 @@
 using UnityEngine;
 using System.Collections.Generic;
 
+[ExecuteAlways]
 [DisallowMultipleComponent]
-public class GrassField : MonoBehaviour
+public class GrassField : MonoBehaviour, IProcgenInstancedSource
 {
     public ProceduralTerrain terrainSource;
     public Material grassMaterial;
@@ -14,70 +15,103 @@ public class GrassField : MonoBehaviour
     public int seed = 99;
 
     [Header("Placement rules")]
-    [Range(0f,1f)] public float maxSlope01 = 0.55f; // avoid steep
-    [Range(0f,1f)] public float moistureBias = 0.8f; // prefer wet
+    [Range(0f,1f)] public float maxSlope01 = 0.55f;
+    [Range(0f,1f)] public float moistureBias = 0.8f;
+    [Range(0f,1f)] public float minSpawnProb = 0.12f;
 
     [Header("Blade size (meters)")]
     public Vector2 heightRange = new Vector2(0.6f, 1.2f);
     public Vector2 widthRange  = new Vector2(0.04f, 0.07f);
 
-    readonly List<Matrix4x4[]> _batches = new();
+    // instancing data
+    readonly List<Matrix4x4[]> _batches = new();                  // raw instancing chunks
+    readonly List<ProcgenCullingHub.Batch> _exposedBatches = new(); // hub-facing batches
     const int kMaxPerBatch = 1023;
 
     Mesh _bladeMesh;
     System.Random _rng;
 
-    void Start(){ if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>(); Build(); }
-    [ContextMenu("Rebuild Now")] public void Build(){ Scatter(); PrepareBatches(); }
-    void OnDisable(){ _batches.Clear(); }
+    void Start() { if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>(); EnsureDefaults(); Build(); }
+    void OnDisable() { _batches.Clear(); _exposedBatches.Clear(); }
+
+    [ContextMenu("Rebuild Now")]
+    public void Build()
+    {
+        EnsureDefaults();
+        Scatter();
+        PrepareBatches();
+        var hub = Object.FindFirstObjectByType<ProcgenCullingHub>(); if (hub) hub.NotifyDirty();
+    }
+
+    void EnsureDefaults()
+    {
+        if (!_bladeMesh) _bladeMesh = BuildBladeMesh();
+        if (!grassMaterial)
+        {
+            var sh = Shader.Find("URP/GrassWindUnlit");
+            if (!sh) sh = Shader.Find("Universal Render Pipeline/Unlit");
+            grassMaterial = new Material(sh) { name = "M_Grass (runtime)" };
+        }
+        grassMaterial.enableInstancing = true;
+        if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>();
+    }
 
     void Scatter()
     {
-        if (!_bladeMesh) _bladeMesh = BuildBladeMesh();
         _batches.Clear();
         _rng = new System.Random(seed);
 
-        List<Vector2> accepted = new();
-        int attempts = 0, maxAttempts = bladeCount * 25;
         var mats = new List<Matrix4x4>();
+        var accepted = new List<Vector2>();
+
+        var t = terrainSource ? terrainSource.terrain : null;
+        var hasTerrain = t && t.terrainData;
+
+        int attempts = 0, maxAttempts = Mathf.Max(1, bladeCount) * 25;
 
         while (accepted.Count < bladeCount && attempts < maxAttempts)
         {
             attempts++;
-            Vector2 p;
-            p.x = (float)(_rng.NextDouble() - 0.5) * areaSize.x;
-            p.y = (float)(_rng.NextDouble() - 0.5) * areaSize.y;
+
+            Vector2 pLocal;
+            pLocal.x = (float)(_rng.NextDouble() - 0.5) * areaSize.x;
+            pLocal.y = (float)(_rng.NextDouble() - 0.5) * areaSize.y;
 
             bool ok = true;
             for (int i = 0; i < accepted.Count; i++)
-                if ((accepted[i] - p).sqrMagnitude < minSpacing * minSpacing) { ok = false; break; }
+                if ((accepted[i] - pLocal).sqrMagnitude < minSpacing * minSpacing) { ok = false; break; }
             if (!ok) continue;
 
-            Vector3 pos = new Vector3(p.x, 0f, p.y);
+            Vector3 pos = transform.position + new Vector3(pLocal.x, 0f, pLocal.y);
+
             float slope01 = 0f, moist01 = 1f;
-            if (terrainSource && terrainSource.terrain)
+            if (hasTerrain)
             {
-                // snap to ground
-                var td = terrainSource.terrain.terrainData;
-                pos.y = terrainSource.terrain.SampleHeight(pos) + terrainSource.terrain.transform.position.y;
-                if (!terrainSource.TrySampleMasks(pos, out slope01, out moist01)) { slope01 = 0f; moist01 = 1f; }
+                var td = t.terrainData;
+                Vector3 tLocal = pos - t.transform.position;
+                if (tLocal.x < 0f || tLocal.z < 0f || tLocal.x > td.size.x || tLocal.z > td.size.z)
+                    continue;
+
+                pos.y = t.SampleHeight(pos) + t.transform.position.y;
+
+                if (!terrainSource.TrySampleMasks(pos, out slope01, out moist01))
+                { slope01 = 0f; moist01 = 1f; }
             }
 
             if (slope01 > maxSlope01) continue;
-            float spawnProb = Mathf.Lerp(1f, moist01, moistureBias);
+
+            float spawnProb = Mathf.Max(minSpawnProb, Mathf.Lerp(1f, moist01, moistureBias));
             if (_rng.NextDouble() > spawnProb) continue;
 
-            accepted.Add(p);
+            accepted.Add(pLocal);
 
             float h = Mathf.Lerp(heightRange.x, heightRange.y, (float)_rng.NextDouble());
             float w = Mathf.Lerp(widthRange.x,  widthRange.y,  (float)_rng.NextDouble());
             float yRot = (float)_rng.NextDouble() * 360f;
 
-            var mat = Matrix4x4.TRS(pos, Quaternion.Euler(0, yRot, 0), new Vector3(w, h, w));
-            mats.Add(mat);
+            mats.Add(Matrix4x4.TRS(pos, Quaternion.Euler(0, yRot, 0), new Vector3(w, h, w)));
         }
 
-        // split to batches
         int offset = 0;
         while (offset < mats.Count)
         {
@@ -87,21 +121,37 @@ public class GrassField : MonoBehaviour
             _batches.Add(arr);
             offset += count;
         }
+
+        // Debug.Log($"Grass blades accepted: {mats.Count}");
     }
 
-    void PrepareBatches() { /* already prepared in Scatter */ }
-
-    void LateUpdate()
+    void PrepareBatches()
     {
-        if (_batches.Count == 0 || !grassMaterial || !_bladeMesh) return;
+        _exposedBatches.Clear();
         foreach (var arr in _batches)
-            Graphics.DrawMeshInstanced(_bladeMesh, 0, grassMaterial, arr, arr.Length, null,
-                UnityEngine.Rendering.ShadowCastingMode.Off, true, gameObject.layer);
+        {
+            Vector3 min = new(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+            Vector3 max = new(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+            for (int i = 0; i < arr.Length; i++)
+            {
+                var p = arr[i].GetColumn(3);
+                if (p.x < min.x) min.x = p.x; if (p.y < min.y) min.y = p.y; if (p.z < min.z) min.z = p.z;
+                if (p.x > max.x) max.x = p.x; if (p.y > max.y) max.y = p.y; if (p.z > max.z) max.z = p.z;
+            }
+            var b = new Bounds(); b.SetMinMax(min, max); b.Expand(0.5f);
+
+        _exposedBatches.Add(new ProcgenCullingHub.Batch {
+            mesh = _bladeMesh, submeshIndex = 0, material = grassMaterial, matrices = arr, bounds = b,
+            layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.Off, receiveShadows = false
+        });
+
+        }
     }
+
+    public List<ProcgenCullingHub.Batch> GetInstancedBatches() => _exposedBatches;
 
     static Mesh BuildBladeMesh()
     {
-        // Vertical quad, base at y=0, top at y=1, centered on x.
         var m = new Mesh { name = "GrassBlade" };
         var v = new Vector3[] { new(-0.5f,0,0), new(0.5f,0,0), new(-0.5f,1,0), new(0.5f,1,0) };
         var n = new Vector3[] { Vector3.up, Vector3.up, Vector3.up, Vector3.up };
