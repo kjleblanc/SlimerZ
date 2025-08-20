@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 [ExecuteAlways]
 [DisallowMultipleComponent]
-public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
+public class InstancedRockField : ProcgenSpawnerBase
 {
     [Header("Area (X-Z)")]
     public Vector2 areaSize = new Vector2(140, 140);
@@ -47,6 +47,10 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
     [Header("Rendering")]
     public Material rockMaterial;
 
+    [Header("Batching")]
+    public bool chunkedBatches = true;
+
+
     // internals
     readonly List<Mesh> _variantMeshes = new();
     readonly Dictionary<Mesh, List<Matrix4x4>> _instanced = new();
@@ -54,31 +58,51 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
     const int kMaxPerBatch = 1023;
     System.Random _rng;
 
-    void Start() { if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>(); Rebuild(); }
-    void OnDisable() { ClearChildren(); _exposedBatches.Clear(); }
+    void Start()
+    {
+        if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>();
+        EnsureDefaults();
+        Rebuild();
+    }
+
+    void EnsureDefaults()
+    {
+        if (!rockMaterial)
+        {
+            var sh = Shader.Find("Universal Render Pipeline/Lit");
+            rockMaterial = new Material(sh) { name = "M_Rock (runtime)" };
+        }
+        rockMaterial.enableInstancing = true;
+    }
+
+    public override void Configure(WorldContext ctx)
+    {
+        base.Configure(ctx);
+        if (!terrainSource && ctx != null) terrainSource = ctx.Root.GetComponentInChildren<ProceduralTerrain>();
+    }
 
     [ContextMenu("Rebuild Now")]
-    public void Rebuild()
+    public override void Rebuild()
     {
-        ClearChildren();
+        EnsureDefaults();
+        ClearAll();
+
+        // Pull biome rules if provided
+        if (Ctx != null && Ctx.Biome != null)
+        {
+            minSlope01  = Ctx.Biome.rockMinSlope01;
+            drynessBias = Ctx.Biome.rockDrynessBias;
+        }
+
         BuildVariants();
         ScatterAndBuild();
         PrepareBatches();
-        var hub = Object.FindFirstObjectByType<ProcgenCullingHub>(); if (hub) hub.NotifyDirty();
+        NotifyHub();
     }
 
-    void ClearChildren()
+    void ClearAll()
     {
-        for (int i = transform.childCount - 1; i >= 0; i--)
-        {
-            var c = transform.GetChild(i);
-#if UNITY_EDITOR
-            if (!Application.isPlaying) DestroyImmediate(c.gameObject);
-            else Destroy(c.gameObject);
-#else
-            Destroy(c.gameObject);
-#endif
-        }
+        DestroyAllChildren();
 #if UNITY_EDITOR
         foreach (var m in _variantMeshes) if (m) DestroyImmediate(m);
 #else
@@ -86,6 +110,7 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
 #endif
         _variantMeshes.Clear();
         _instanced.Clear();
+        _exposedBatches.Clear();
     }
 
     void BuildVariants()
@@ -105,13 +130,6 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
 
     void ScatterAndBuild()
     {
-        if (!rockMaterial)
-        {
-            var sh = Shader.Find("Universal Render Pipeline/Lit");
-            rockMaterial = new Material(sh) { name = "M_Rock (runtime)" };
-        }
-        rockMaterial.enableInstancing = true;
-
         List<Vector2> accepted = new();
         int attempts = 0, maxAttempts = Mathf.Max(1, totalRocks) * 30;
 
@@ -119,15 +137,18 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
         {
             attempts++;
 
+            // sample in local XZ around this spawner
             Vector2 pLocal;
             pLocal.x = (float)(_rng.NextDouble() - 0.5f) * areaSize.x;
             pLocal.y = (float)(_rng.NextDouble() - 0.5f) * areaSize.y;
 
+            // spacing
             bool ok = true;
             for (int i = 0; i < accepted.Count; i++)
                 if ((accepted[i] - pLocal).sqrMagnitude < minSpacing * minSpacing) { ok = false; break; }
             if (!ok) continue;
 
+            // to world
             Vector3 pos = transform.position + new Vector3(pLocal.x, 0f, pLocal.y);
             Vector3 hitNormal = Vector3.up;
 
@@ -158,6 +179,7 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
             var mat = Matrix4x4.TRS(pos, rot, new Vector3(s, s, s));
             var mesh = _variantMeshes[_rng.Next(_variantMeshes.Count)];
 
+            // near-field: real GO for collisions & shadows
             if ((pos - transform.position).magnitude <= colliderRadius)
             {
                 var go = new GameObject("Rock (Collider LOD)");
@@ -182,37 +204,69 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
     void PrepareBatches()
     {
         _exposedBatches.Clear();
+        bool useChunks = chunkedBatches && Ctx != null && Ctx.Grid != null;
+
         foreach (var kv in _instanced)
         {
             var mats = kv.Value;
-            int offset = 0;
-            while (offset < mats.Count)
+            if (!useChunks)
             {
-                int count = Mathf.Min(kMaxPerBatch, mats.Count - offset);
-                var arr = new Matrix4x4[count];
-                mats.CopyTo(offset, arr, 0, count);
-                offset += count;
-
-                Vector3 min = new(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
-                Vector3 max = new(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
-                for (int i = 0; i < arr.Length; i++)
+                int offset = 0;
+                while (offset < mats.Count)
                 {
-                    var p = arr[i].GetColumn(3);
-                    if (p.x < min.x) min.x = p.x; if (p.y < min.y) min.y = p.y; if (p.z < min.z) min.z = p.z;
-                    if (p.x > max.x) max.x = p.x; if (p.y > max.y) max.y = p.y; if (p.z > max.z) max.z = p.z;
+                    int count = Mathf.Min(kMaxPerBatch, mats.Count - offset);
+                    var arr = new Matrix4x4[count];
+                    mats.CopyTo(offset, arr, 0, count);
+                    offset += count;
+
+                    Vector3 min = new(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+                    Vector3 max = new(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var p = arr[i].GetColumn(3);
+                        if (p.x < min.x) min.x = p.x; if (p.y < min.y) min.y = p.y; if (p.z < min.z) min.z = p.z;
+                        if (p.x > max.x) max.x = p.x; if (p.y > max.y) max.y = p.y; if (p.z > max.z) max.z = p.z;
+                    }
+                    var b = new Bounds(); b.SetMinMax(min, max); b.Expand(radius * 1.5f);
+
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 0, material = rockMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
                 }
-                var b = new Bounds(); b.SetMinMax(min, max); b.Expand(radius * 1.5f);
+                continue;
+            }
 
-                _exposedBatches.Add(new ProcgenCullingHub.Batch {
-                mesh = kv.Key, submeshIndex = 0, material = rockMaterial, matrices = arr, bounds = b,
-                layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true
-                });
+            // chunked path
+            var grid = Ctx.Grid;
+            var byChunk = new Dictionary<ChunkId, List<Matrix4x4>>(64);
+            for (int i = 0; i < mats.Count; i++)
+            {
+                Vector3 p = mats[i].GetColumn(3);
+                var id = grid.IdAt(p);
+                if (!byChunk.TryGetValue(id, out var list)) byChunk[id] = list = new List<Matrix4x4>();
+                list.Add(mats[i]);
+            }
 
+            foreach (var ck in byChunk)
+            {
+                var list = ck.Value;
+                int offset = 0;
+                while (offset < list.Count)
+                {
+                    int count = Mathf.Min(kMaxPerBatch, list.Count - offset);
+                    var arr = new Matrix4x4[count];
+                    list.CopyTo(offset, arr, 0, count);
+                    offset += count;
+
+                    var b = grid.BoundsOf(ck.Key);
+                    b.Expand(radius * 1.5f);
+
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 0, material = rockMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
+                }
             }
         }
     }
 
-    public List<ProcgenCullingHub.Batch> GetInstancedBatches() => _exposedBatches;
+
+    public override List<ProcgenCullingHub.Batch> GetInstancedBatches() => _exposedBatches;
 
     // ---------- mesh generation ----------
     Mesh GenerateRockMesh(int sub, float rad, float nScale, float nAmp, int oct, float pers, float lac,
@@ -224,13 +278,17 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
 
         for (int i = 0; i < verts.Count; i++)
         {
-            Vector3 v = verts[i]; Vector3 n = v.normalized;
+            Vector3 v = verts[i];
+            Vector3 n = v.normalized;
             float h = FBm3D(v * nScale, oct, pers, lac);
             float disp = 1f + nAmp * (h * 2f - 1f);
             v = n * rad * disp;
 
             if (doFlatten && v.y < flatH)
-            { float t = Mathf.InverseLerp(flatH - flatSmooth, flatH, v.y); v.y = Mathf.Lerp(flatH, v.y, t); }
+            {
+                float t = Mathf.InverseLerp(flatH - flatSmooth, flatH, v.y);
+                v.y = Mathf.Lerp(flatH, v.y, t);
+            }
             verts[i] = v;
         }
 
@@ -239,7 +297,9 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
         var mesh = new Mesh();
         mesh.SetVertices(verts);
         mesh.SetTriangles(tris, 0, true);
-        mesh.RecalculateBounds(); mesh.RecalculateNormals(); mesh.RecalculateTangents();
+        mesh.RecalculateBounds();
+        mesh.RecalculateNormals();
+        mesh.RecalculateTangents();
         return mesh;
     }
 
@@ -252,6 +312,7 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
         {
             Vector3 n = faceNormals[f], t = faceTangents[f], b = Vector3.Cross(n, t);
             int start = verts.Count;
+
             for (int y = 0; y <= sub; y++)
                 for (int x = 0; x <= sub; x++)
                 {
@@ -260,6 +321,7 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
                     Vector3 p = (n + uv.x * t + uv.y * b).normalized * radius;
                     verts.Add(p);
                 }
+
             for (int y = 0; y < sub; y++)
                 for (int x = 0; x < sub; x++)
                 {
@@ -275,7 +337,8 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
 
     static void MakeFlatShaded(List<Vector3> vin, List<int> tin, out List<Vector3> vout, out List<int> tout)
     {
-        vout = new List<Vector3>(tin.Count); tout = new List<int>(tin.Count);
+        vout = new List<Vector3>(tin.Count);
+        tout = new List<int>(tin.Count);
         for (int i = 0; i < tin.Count; i++) { vout.Add(vin[tin[i]]); tout.Add(i); }
     }
 
@@ -292,4 +355,5 @@ public class InstancedRockField_Terrain : MonoBehaviour, IProcgenInstancedSource
         return total / Mathf.Max(0.0001f, norm);
     }
 }
+
 

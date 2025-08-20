@@ -1,16 +1,15 @@
-// Assets/Scripts/Procgen/InstancedTreeField.cs
 using UnityEngine;
 using System.Collections.Generic;
 
 [ExecuteAlways]
 [DisallowMultipleComponent]
-public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
+public class InstancedTreeField : ProcgenSpawnerBase
 {
     [Header("Area (X-Z)")]
     public Vector2 areaSize = new Vector2(160, 160);
 
     [Header("Counts & LOD")]
-    public float colliderRadius = 28f;              // real MeshRenderer/MeshCollider within this radius
+    public float colliderRadius = 28f;
     [Range(1, 8000)] public int totalTrees = 600;
     public float minSpacing = 3.2f;
     public int seed = 1337;
@@ -27,14 +26,13 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
     [Header("Variants")]
     [Range(1, 16)] public int variants = 6;
 
-    // === ProceduralTree-style controls (restored) ===
+    // ProceduralTree-style controls
     [Header("Trunk")]
     [Range(2, 64)] public int trunkSegments = 18;
     [Range(6, 24)] public int trunkSides = 10;
     public float trunkHeight = 6f;
     public float trunkBaseRadius = 0.35f;
     public float trunkTopRadius = 0.12f;
-    [Tooltip("How much the trunk meanders sideways")]
     public float trunkBend = 0.6f;
 
     [Header("Branches")]
@@ -43,14 +41,14 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
     [Range(6, 24)] public int branchSides = 8;
     public Vector2 branchLengthRange = new Vector2(1.5f, 3.0f);
     public float branchRadiusScale = 0.35f;
-    [Tooltip("How much branches curve upward")] public float branchCurve = 0.6f;
-    [Tooltip("Y% along trunk to begin placing branches (0..1)")] public float branchStart = 0.2f;
-    [Tooltip("Y% along trunk to stop placing branches (0..1)")]  public float branchEnd = 0.9f;
+    public float branchCurve = 0.6f;
+    public float branchStart = 0.2f;
+    public float branchEnd = 0.9f;
 
-    [Header("Leaves (low-poly blobs, submesh 1)")]
+    [Header("Leaves")]
     public int leavesPerBranch = 2;
     public float leafBlobRadius = 0.5f;
-    [Range(1, 5)] public int leafBlobSubdiv = 2; // 1..5 on a cube-sphere
+    [Range(1, 5)] public int leafBlobSubdiv = 2;
     public Vector2 leafBlobScaleJitter = new Vector2(0.8f, 1.4f);
 
     [Header("Per-tree Randomization")]
@@ -60,6 +58,10 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
     [Header("Rendering")]
     public Material woodMaterial;
     public Material leafMaterial;
+
+    [Header("Batching")]
+    public bool chunkedBatches = true;
+
 
     // internals
     readonly List<Mesh> _variantMeshes = new();
@@ -71,38 +73,45 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
     void Start()
     {
         if (!terrainSource) terrainSource = Object.FindFirstObjectByType<ProceduralTerrain>();
+        EnsureDefaults();
         Rebuild();
     }
 
-    void OnDisable()
+    void EnsureDefaults()
     {
-        ClearChildren();
-        _exposedBatches.Clear();
+        if (!woodMaterial) woodMaterial = new Material(Shader.Find("Universal Render Pipeline/Lit")) { name = "M_Wood (runtime)" };
+        if (!leafMaterial) leafMaterial = new Material(Shader.Find("Universal Render Pipeline/Lit")) { name = "M_Leaves (runtime)" };
+        woodMaterial.enableInstancing = true; leafMaterial.enableInstancing = true;
+    }
+
+    public override void Configure(WorldContext ctx)
+    {
+        base.Configure(ctx);
+        if (!terrainSource && ctx != null) terrainSource = ctx.Root.GetComponentInChildren<ProceduralTerrain>();
     }
 
     [ContextMenu("Rebuild Now")]
-    public void Rebuild()
+    public override void Rebuild()
     {
-        ClearChildren();
+        EnsureDefaults();
+        ClearAll();
+
+        // Apply biome if present
+        if (Ctx != null && Ctx.Biome != null)
+        {
+            maxSlope01   = Ctx.Biome.treeMaxSlope01;
+            moistureBias = Ctx.Biome.treeMoistureBias;
+        }
+
         BuildVariants();
         ScatterAndBuild();
         PrepareBatches();
-        var hub = Object.FindFirstObjectByType<ProcgenCullingHub>();
-        if (hub) hub.NotifyDirty();
+        NotifyHub();
     }
 
-    void ClearChildren()
+    void ClearAll()
     {
-        for (int i = transform.childCount - 1; i >= 0; i--)
-        {
-            var c = transform.GetChild(i);
-#if UNITY_EDITOR
-            if (!Application.isPlaying) DestroyImmediate(c.gameObject);
-            else Destroy(c.gameObject);
-#else
-            Destroy(c.gameObject);
-#endif
-        }
+        DestroyAllChildren();
 #if UNITY_EDITOR
         foreach (var m in _variantMeshes) if (m) DestroyImmediate(m);
 #else
@@ -110,6 +119,7 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
 #endif
         _variantMeshes.Clear();
         _instanced.Clear();
+        _exposedBatches.Clear();
     }
 
     void BuildVariants()
@@ -117,8 +127,7 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
         _rng = new System.Random(seed);
         for (int v = 0; v < variants; v++)
         {
-            int vSeed = _rng.Next();
-            var mesh = GenerateTreeMesh(vSeed);
+            var mesh = GenerateTreeMesh(_rng.Next());
             mesh.name = $"TreeVariant_{v}";
             _variantMeshes.Add(mesh);
         }
@@ -126,11 +135,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
 
     void ScatterAndBuild()
     {
-        if (!woodMaterial) woodMaterial = new Material(Shader.Find("Universal Render Pipeline/Lit")) { name = "M_Wood (runtime)" };
-        if (!leafMaterial) leafMaterial = new Material(Shader.Find("Universal Render Pipeline/Lit")) { name = "M_Leaves (runtime)" };
-        woodMaterial.enableInstancing = true;
-        leafMaterial.enableInstancing = true;
-
         List<Vector2> accepted = new();
         int attempts = 0, maxAttempts = totalTrees * 40;
 
@@ -138,31 +142,28 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
         {
             attempts++;
 
-            // local proposal around this spawner (centered on transform)
             Vector2 pLocal;
             pLocal.x = (float)(_rng.NextDouble() - 0.5f) * areaSize.x;
             pLocal.y = (float)(_rng.NextDouble() - 0.5f) * areaSize.y;
 
-            // spacing
             bool ok = true;
             for (int i = 0; i < accepted.Count; i++)
                 if ((accepted[i] - pLocal).sqrMagnitude < minSpacing * minSpacing) { ok = false; break; }
             if (!ok) continue;
 
-            // world pos (+ ground snap)
             Vector3 pos = transform.position + new Vector3(pLocal.x, 0f, pLocal.y);
             Vector3 hitNormal = Vector3.up;
+
             if (snapToGround)
             {
                 var ray = new Ray(pos + Vector3.up * rayStartHeight, Vector3.down);
                 if (Physics.Raycast(ray, out var hit, rayMaxDistance, groundMask, QueryTriggerInteraction.Ignore))
                 {
-                    pos = hit.point - hit.normal * 0.015f; // tiny push-down to avoid floating
+                    pos = hit.point - hit.normal * 0.015f; // tiny push-down to avoid hovering
                     hitNormal = hit.normal;
                 }
             }
 
-            // masks (fallback to normal if no terrain)
             float slope01 = 0f, moisture01 = 1f;
             bool hasMasks = terrainSource && terrainSource.TrySampleMasks(pos, out slope01, out moisture01);
             if (!hasMasks)
@@ -185,7 +186,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
 
             if ((pos - transform.position).magnitude <= colliderRadius)
             {
-                // near-field: real GameObject with collider + shadows
                 var go = new GameObject("Tree (Collider LOD)");
                 go.transform.SetPositionAndRotation(pos, rot);
                 go.transform.localScale = new Vector3(s, s, s);
@@ -208,44 +208,76 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
     void PrepareBatches()
     {
         _exposedBatches.Clear();
-        foreach (var kv in _instanced)
+
+        // Group per mesh → per chunk → split into ≤1023
+        bool useChunks = chunkedBatches && Ctx != null && Ctx.Grid != null;
+
+        foreach (var kv in _instanced) // kv.Key = Mesh, kv.Value = List<Matrix4x4>
         {
             var mats = kv.Value;
-            int offset = 0;
-            while (offset < mats.Count)
+            if (!useChunks)
             {
-                int count = Mathf.Min(kMaxPerBatch, mats.Count - offset);
-                var arr = new Matrix4x4[count];
-                mats.CopyTo(offset, arr, 0, count);
-                offset += count;
-
-                // bounds
-                Vector3 min = new(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
-                Vector3 max = new(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
-                for (int i = 0; i < arr.Length; i++)
+                // old path: single big bounds from positions
+                int offset = 0;
+                while (offset < mats.Count)
                 {
-                    var p = arr[i].GetColumn(3);
-                    if (p.x < min.x) min.x = p.x; if (p.y < min.y) min.y = p.y; if (p.z < min.z) min.z = p.z;
-                    if (p.x > max.x) max.x = p.x; if (p.y > max.y) max.y = p.y; if (p.z > max.z) max.z = p.z;
-                }
-                var b = new Bounds(); b.SetMinMax(min, max); b.Expand(1.0f);
+                    int count = Mathf.Min(kMaxPerBatch, mats.Count - offset);
+                    var arr = new Matrix4x4[count];
+                    mats.CopyTo(offset, arr, 0, count);
+                    offset += count;
 
-                // two submeshes: 0 = wood, 1 = leaves
-                _exposedBatches.Add(new ProcgenCullingHub.Batch {
-                    mesh = kv.Key, submeshIndex = 0, material = woodMaterial, matrices = arr, bounds = b,
-                    layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true
-                });
-                _exposedBatches.Add(new ProcgenCullingHub.Batch {
-                    mesh = kv.Key, submeshIndex = 1, material = leafMaterial, matrices = arr, bounds = b,
-                    layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true
-                });
+                    Vector3 min = new(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+                    Vector3 max = new(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var p = arr[i].GetColumn(3);
+                        if (p.x < min.x) min.x = p.x; if (p.y < min.y) min.y = p.y; if (p.z < min.z) min.z = p.z;
+                        if (p.x > max.x) max.x = p.x; if (p.y > max.y) max.y = p.y; if (p.z > max.z) max.z = p.z;
+                    }
+                    var b = new Bounds(); b.SetMinMax(min, max); b.Expand(1.0f);
+
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 0, material = woodMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 1, material = leafMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
+                }
+                continue;
+            }
+
+            // chunked path
+            var grid = Ctx.Grid;
+            var byChunk = new Dictionary<ChunkId, List<Matrix4x4>>(64);
+            for (int i = 0; i < mats.Count; i++)
+            {
+                Vector3 p = mats[i].GetColumn(3);
+                var id = grid.IdAt(p);
+                if (!byChunk.TryGetValue(id, out var list)) byChunk[id] = list = new List<Matrix4x4>();
+                list.Add(mats[i]);
+            }
+
+            foreach (var ck in byChunk)
+            {
+                var list = ck.Value;
+                int offset = 0;
+                while (offset < list.Count)
+                {
+                    int count = Mathf.Min(kMaxPerBatch, list.Count - offset);
+                    var arr = new Matrix4x4[count];
+                    list.CopyTo(offset, arr, 0, count);
+                    offset += count;
+
+                    var b = grid.BoundsOf(ck.Key);
+                    b.Expand(1.0f);
+
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 0, material = woodMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
+                    _exposedBatches.Add(new ProcgenCullingHub.Batch { mesh = kv.Key, submeshIndex = 1, material = leafMaterial, matrices = arr, bounds = b, layer = gameObject.layer, shadowCasting = UnityEngine.Rendering.ShadowCastingMode.On, receiveShadows = true });
+                }
             }
         }
     }
 
-    public List<ProcgenCullingHub.Batch> GetInstancedBatches() => _exposedBatches;
 
-    // ========= mesh generation (ProceduralTree-style) =========
+    public override List<ProcgenCullingHub.Batch> GetInstancedBatches() => _exposedBatches;
+
+    // ===== mesh gen (trunk, branches, leaves) =====
     Mesh GenerateTreeMesh(int localSeed)
     {
         var rng = new System.Random(localSeed);
@@ -253,10 +285,10 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
         var verts = new List<Vector3>();
         var norms = new List<Vector3>();
         var uvs   = new List<Vector2>();
-        var trisWood   = new List<int>();   // submesh 0
-        var trisLeaves = new List<int>();   // submesh 1
+        var trisWood   = new List<int>();
+        var trisLeaves = new List<int>();
 
-        // --- trunk path with bend ---
+        // trunk path with bend
         var trunkPath = new List<Vector3>(trunkSegments + 1);
         for (int i = 0; i <= trunkSegments; i++)
         {
@@ -268,7 +300,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
             trunkPath.Add(new Vector3(off.x, y, off.y));
         }
 
-        // --- trunk tube radii ---
         var trunkRadii = new List<float>(trunkSegments + 1);
         for (int i = 0; i <= trunkSegments; i++)
         {
@@ -277,36 +308,29 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
         }
         AddTube(trunkPath, trunkRadii, trunkSides, ref verts, ref norms, ref uvs, ref trisWood);
 
-        // --- branch anchors ---
-        var anchorIndices = new List<int>();
+        // branch anchors
         int iStart = Mathf.CeilToInt(Mathf.Clamp01(branchStart) * trunkSegments);
         int iEnd   = Mathf.FloorToInt(Mathf.Clamp01(branchEnd) * trunkSegments);
         iStart = Mathf.Clamp(iStart, 1, trunkSegments - 2);
         iEnd   = Mathf.Clamp(iEnd, iStart + 1, trunkSegments - 1);
 
         for (int b = 0; b < branchCount; b++)
-            anchorIndices.Add(rng.Next(iStart, iEnd + 1));
-
-        // --- branches + leaves ---
-        foreach (int idx in anchorIndices)
         {
-            // data at trunk
+            int idx = Mathf.Clamp(Mathf.RoundToInt(Mathf.Lerp(iStart, iEnd, (float)rng.NextDouble())), iStart, iEnd);
+
             Vector3 basePos = trunkPath[idx];
             Vector3 nextPos = trunkPath[Mathf.Min(idx + 1, trunkPath.Count - 1)];
             Vector3 prevPos = trunkPath[Mathf.Max(idx - 1, 0)];
             Vector3 trunkTangent = (nextPos - prevPos).normalized;
 
-            // random azimuth around trunk
-            float az = (float)(rng.NextDouble() * Mathf.PI * 2f);
             OrthonormalBasis(trunkTangent, out var right, out var binorm);
+            float az = (float)(rng.NextDouble() * Mathf.PI * 2f);
             Vector3 outward = (Mathf.Cos(az) * right + Mathf.Sin(az) * binorm).normalized;
 
-            // branch params
             float len = Mathf.Lerp(branchLengthRange.x, branchLengthRange.y, (float)rng.NextDouble());
             float baseRadius = Mathf.Lerp(trunkBaseRadius, trunkTopRadius, (float)idx / trunkSegments) * branchRadiusScale;
             int segs = branchSegments;
 
-            // branch path (curves upward)
             var path = new List<Vector3>(segs + 1);
             for (int i = 0; i <= segs; i++)
             {
@@ -317,7 +341,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
                 path.Add(p);
             }
 
-            // radii taper
             var radii = new List<float>(segs + 1);
             for (int i = 0; i <= segs; i++)
             {
@@ -327,7 +350,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
 
             AddTube(path, radii, branchSides, ref verts, ref norms, ref uvs, ref trisWood);
 
-            // leaves near tip
             Vector3 tip = path[path.Count - 1];
             for (int k = 0; k < Mathf.Max(1, leavesPerBranch); k++)
             {
@@ -337,7 +359,6 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
             }
         }
 
-        // --- finalize mesh (2 submeshes) ---
         var mesh = new Mesh { name = "TreeMesh" };
         mesh.subMeshCount = 2;
         mesh.SetVertices(verts);
@@ -350,7 +371,7 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
         return mesh;
     }
 
-    // ========= helpers (mirroring ProceduralTree) =========
+    // ===== helpers =====
     static void OrthonormalBasis(Vector3 t, out Vector3 right, out Vector3 binorm)
     {
         t = t.normalized;
@@ -386,7 +407,7 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
 
             if (i > 0)
             {
-                right = Vector3.Slerp(prevRight, right, 0.5f).normalized;
+                right  = Vector3.Slerp(prevRight,  right,  0.5f).normalized;
                 binorm = Vector3.Slerp(prevBinorm, binorm, 0.5f).normalized;
             }
             prevRight = right; prevBinorm = binorm;
@@ -452,7 +473,7 @@ public class InstancedTreeField : MonoBehaviour, IProcgenInstancedSource
                 for (int x = 0; x <= sub; x++)
                 {
                     float u = (float)x / sub, v = (float)y / sub;
-                    Vector2 uv = new Vector2(u * 2f - 1f, v * 2f - 1f);
+                    Vector2 uv = new(u * 2f - 1f, v * 2f - 1f);
                     Vector3 p = (n + uv.x * t + uv.y * b).normalized * radius;
                     verts.Add(p);
                 }

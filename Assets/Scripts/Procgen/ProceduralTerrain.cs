@@ -8,7 +8,7 @@ using UnityEditor;
 
 [ExecuteAlways]
 [DisallowMultipleComponent]
-public class ProceduralTerrain : MonoBehaviour
+public class ProceduralTerrain : MonoBehaviour, IWorldMaskProvider
 {
     [Header("Resolution & Size")]
     [Tooltip("(2^n)+1 in [33..4097]. Common: 257, 513, 1025.")]
@@ -36,6 +36,7 @@ public class ProceduralTerrain : MonoBehaviour
 
     [Header("Mask Calibration")]
     public bool autoCalibrateMasks = true;
+    
 
     [Header("Auto-paint Terrain")]
     public bool autoPaint = true;
@@ -59,6 +60,9 @@ public class ProceduralTerrain : MonoBehaviour
     public Terrain terrain;
     public Texture2D slopeMask;    // grayscale
     public Texture2D moistureMask; // grayscale
+
+    [Header("Batching")]
+    public bool chunkedBatches = true;
 
     System.Random rng;
 
@@ -380,6 +384,9 @@ public class ProceduralTerrain : MonoBehaviour
         moisture01 = moistureMask.GetPixelBilinear(u, v).r;
         return true;
     }
+
+    public bool TrySample(Vector3 worldPos, out float slope01, out float moisture01)
+        => TrySampleMasks(worldPos, out slope01, out moisture01);
 
     // ===== Noise =====
     float Perlin(float x, float y) => Mathf.PerlinNoise(x, y);
