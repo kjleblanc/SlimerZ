@@ -9,10 +9,11 @@ public class ProcgenWorld : MonoBehaviour
 {
     [Header("What to generate")]
     public bool makeTerrain = true;
-    public bool makeWater   = true;  // NEW
+    public bool makeWater   = true; 
     public bool makeTrees   = true;
     public bool makeRocks   = true;
     public bool makeGrass   = true;
+    public bool makeFoliage = true; // NEW
 
     [Header("World seed")]
     public int seed = 1337;
@@ -21,7 +22,7 @@ public class ProcgenWorld : MonoBehaviour
     public bool useChunkGrid = true;
     public Vector2Int gridDims = new Vector2Int(8, 8);
 
-    [Header("Water Settings")]  // NEW
+    [Header("Water Settings")]  
     public float waterLevel = 5f;
     public int minWaterBodySize = 10;
 
@@ -29,9 +30,15 @@ public class ProcgenWorld : MonoBehaviour
     public int trees = 600;
     public int rocks = 1200;
     public int grass = 12000;
+    public int foliage = 800; // NEW
 
     [Header("Collider LOD radius (m)")]
     public float colliderRadius = 28f;
+    public float foliageColliderRadius = 15f; // NEW - smaller radius for foliage
+
+    [Header("Foliage Settings")] // NEW
+    public LSystemPlantPreset[] foliagePresets;
+    [Range(0f, 1f)] public float foliageMixing = 0.5f;
 
     [Header("Biome (rules)")]
     public BiomeProfile biome;
@@ -41,10 +48,11 @@ public class ProcgenWorld : MonoBehaviour
 
     [Header("References (auto-created as children)")]
     public ProceduralTerrain terrain;
-    public ProceduralWater water;                     // NEW
+    public ProceduralWater water;
     public InstancedTreeField treeField;
     public InstancedRockField rockField;
     public GrassField grassField;
+    public InstancedFoliageField foliageField; // NEW
     public ProcgenCullingHub cullingHub;
 
 #if UNITY_EDITOR
@@ -80,7 +88,7 @@ public class ProcgenWorld : MonoBehaviour
             terrain.Rebuild();
         }
 
-        // Water (NEW - build after terrain)
+        // Water
         if (makeWater && water && terrain)
         {
             water.terrainSource = terrain;
@@ -177,6 +185,31 @@ public class ProcgenWorld : MonoBehaviour
             ForceInstancing(grassField.grassMaterial);
         }
 
+        // Foliage (NEW)
+        if (makeFoliage && foliageField)
+        {
+            foliageField.seed = seed + 44;
+            foliageField.transform.position = center;
+            foliageField.areaSize = areaXZ;
+            foliageField.colliderRadius = foliageColliderRadius;
+            foliageField.terrainSource = terrain;
+            foliageField.totalPlants = Mathf.RoundToInt(foliage * (biome ? biome.globalDensity : 1f));
+            foliageField.plantPresets = foliagePresets;
+            foliageField.presetMixing = foliageMixing;
+            foliageField.Configure(ctx);
+            
+            if (biome)
+            {
+                // Foliage has more specific moisture requirements than grass
+                foliageField.maxSlope01 = biome.grassMaxSlope01 * 0.9f;
+                foliageField.moistureRange = biome.grassMoistureBias;
+                foliageField.moistureWidth = 0.3f;
+            }
+            foliageField.Rebuild();
+
+            ForceInstancing(foliageField.branchMaterial, foliageField.leafMaterial);
+        }
+
         if (cullingHub) cullingHub.RefreshAll();
     }
 
@@ -199,7 +232,7 @@ public class ProcgenWorld : MonoBehaviour
             else terrain = tObj;
         }
 
-        // Water (NEW)
+        // Water
         if (!water && makeWater)
         {
             var w = transform.Find("Water")?.GetComponent<ProceduralWater>();
@@ -250,6 +283,59 @@ public class ProcgenWorld : MonoBehaviour
             }
             else grassField = gf;
         }
+
+        // FoliageField (NEW)
+        if (!foliageField && makeFoliage)
+        {
+            var ff = transform.Find("FoliageField")?.GetComponent<InstancedFoliageField>();
+            if (!ff)
+            {
+                var go = new GameObject("FoliageField");
+                go.transform.SetParent(transform, false);
+                foliageField = go.AddComponent<InstancedFoliageField>();
+            }
+            else foliageField = ff;
+        }
+
+        // Ensure default foliage presets if none set
+        if (makeFoliage && (foliagePresets == null || foliagePresets.Length == 0))
+        {
+            CreateDefaultFoliagePresets();
+        }
+    }
+
+    void CreateDefaultFoliagePresets()
+    {
+#if UNITY_EDITOR
+        // Create default presets and save as assets
+        string folderPath = "Assets/FoliagePresets";
+        if (!AssetDatabase.IsValidFolder(folderPath))
+        {
+            AssetDatabase.CreateFolder("Assets", "FoliagePresets");
+        }
+
+        var fern = LSystemPlantPreset.CreateFernPreset();
+        AssetDatabase.CreateAsset(fern, $"{folderPath}/Fern.asset");
+
+        var bush = LSystemPlantPreset.CreateBushPreset();
+        AssetDatabase.CreateAsset(bush, $"{folderPath}/Bush.asset");
+
+        var weed = LSystemPlantPreset.CreateWeedPreset();
+        AssetDatabase.CreateAsset(weed, $"{folderPath}/Weed.asset");
+
+        var sapling = LSystemPlantPreset.CreateSaplingPreset();
+        AssetDatabase.CreateAsset(sapling, $"{folderPath}/Sapling.asset");
+
+        foliagePresets = new[] { fern, bush, weed, sapling };
+        AssetDatabase.SaveAssets();
+#else
+        // Runtime fallback
+        foliagePresets = new[] {
+            LSystemPlantPreset.CreateFernPreset(),
+            LSystemPlantPreset.CreateBushPreset(),
+            LSystemPlantPreset.CreateWeedPreset()
+        };
+#endif
     }
 
     static void ForceInstancing(params Material[] mats)
@@ -258,4 +344,3 @@ public class ProcgenWorld : MonoBehaviour
         foreach (var m in mats) if (m) m.enableInstancing = true;
     }
 }
-
