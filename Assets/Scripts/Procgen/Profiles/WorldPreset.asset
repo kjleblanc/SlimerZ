@@ -1,0 +1,26 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fb3317484f9b2004f9aed56af2cf82d2, type: 3}
+  m_Name: WorldPreset
+  m_EditorClassIdentifier: Assembly-CSharp::WorldPreset
+  seed: 12345
+  gridDims: {x: 12, y: 12}
+  terrain: 1
+  water: 1
+  trees: 1
+  rocks: 1
+  grass: 1
+  foliage: 1
+  terrainProfile: {fileID: 11400000, guid: fddaac3902e9b1e4282ecb706165ce16, type: 2}
+  hydrologyProfile: {fileID: 11400000, guid: 999ba22dd3484644dafbdd80422603a9, type: 2}
+  scatterProfile: {fileID: 11400000, guid: 626ceb3d542211f47af24fa59b88e848, type: 2}
+  biome: {fileID: 0}

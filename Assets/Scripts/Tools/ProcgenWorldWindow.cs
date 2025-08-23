@@ -82,6 +82,34 @@ public class ProcgenWorldWindow : EditorWindow
 
             scroll = EditorGUILayout.BeginScrollView(scroll);
 
+            // PRESET
+            EditorGUILayout.Space(8);
+            EditorGUILayout.LabelField("Preset", EditorStyles.boldLabel);
+
+            world.usePreset = EditorGUILayout.Toggle("Use Preset", world.usePreset);
+            world.preset = (WorldPreset)EditorGUILayout.ObjectField("World Preset", world.preset, typeof(WorldPreset), false);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUI.enabled = world && world.preset && world.usePreset;
+                if (GUILayout.Button("Apply Preset"))
+                {
+                    world.ApplyPresetToScene();
+                    EditorUtility.SetDirty(world);
+                    SceneView.RepaintAll();
+                }
+                if (GUILayout.Button("Apply + Rebuild"))
+                {
+                    world.RebuildFromPreset();
+                    hub?.NotifyDirty();
+                    SceneView.RepaintAll();
+                }
+                GUI.enabled = true;
+            }
+            EditorGUILayout.Space(6);
+            EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
+
+
             // WORLD
             foldWorld = EditorGUILayout.BeginFoldoutHeaderGroup(foldWorld, "World");
             if (foldWorld)
@@ -103,6 +131,14 @@ public class ProcgenWorldWindow : EditorWindow
                         hub?.NotifyDirty();
                         SceneView.RepaintAll();
                     }
+                    if (GUILayout.Button("Build (Stages)", GUILayout.Height(22)))
+                    {
+                        world.BuildViaStages();
+                        hub?.NotifyDirty();
+                        SceneView.RepaintAll();
+                    }
+                    if (GUILayout.Button("Select World", GUILayout.Width(110)))
+                        Selection.activeObject = world;
                 }
 
                 EditorGUILayout.Space(4);
